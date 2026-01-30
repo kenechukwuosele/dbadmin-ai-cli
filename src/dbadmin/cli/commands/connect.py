@@ -110,20 +110,116 @@ def _mask_password(url: str) -> str:
 
 
 def _save_connection(name: str, url: str, db_type: str) -> None:
-    """Save connection to local config file."""
+    """Save connection with encrypted credential storage.
+    
+    Uses the system keyring for secure password storage.
+    Only connection metadata is stored in JSON; credentials go to keyring.
+    """
     import json
     from pathlib import Path
+    from urllib.parse import urlparse, urlunparse
+    
+    # Try to use keyring for secure storage
+    try:
+        import keyring
+        use_keyring = True
+    except ImportError:
+        use_keyring = False
+        console.print("[yellow]Warning: keyring not installed. Credentials will be stored in plain text.[/yellow]")
+        console.print("[dim]Install with: pip install keyring[/dim]")
     
     config_file = Path.home() / ".dbadmin" / "connections.json"
     config_file.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Set restrictive permissions on the config directory (Unix-like systems)
+    try:
+        import os
+        os.chmod(config_file.parent, 0o700)
+    except (OSError, AttributeError):
+        pass  # Windows or permission error
     
     connections = {}
     if config_file.exists():
         connections = json.loads(config_file.read_text())
     
-    connections[name] = {
-        "url": url,
-        "type": db_type,
-    }
+    # Parse URL to extract and secure the password
+    parsed = urlparse(url)
+    
+    if use_keyring and parsed.password:
+        # Store password in system keyring
+        keyring.set_password("dbadmin", f"{name}_password", parsed.password)
+        
+        # Store URL without password in config file
+        safe_url = urlunparse((
+            parsed.scheme,
+            f"{parsed.username}@{parsed.hostname}" + (f":{parsed.port}" if parsed.port else ""),
+            parsed.path,
+            parsed.params,
+            parsed.query,
+            parsed.fragment
+        ))
+        
+        connections[name] = {
+            "url": safe_url,
+            "type": db_type,
+            "has_keyring_password": True,
+        }
+    else:
+        # Fallback: store full URL (less secure)
+        connections[name] = {
+            "url": url,
+            "type": db_type,
+            "has_keyring_password": False,
+        }
     
     config_file.write_text(json.dumps(connections, indent=2))
+    
+    # Set restrictive permissions on the config file
+    try:
+        import os
+        os.chmod(config_file, 0o600)
+    except (OSError, AttributeError):
+        pass
+
+
+def _load_connection(name: str) -> str | None:
+    """Load a saved connection, retrieving password from keyring if needed."""
+    import json
+    from pathlib import Path
+    from urllib.parse import urlparse, urlunparse
+    
+    config_file = Path.home() / ".dbadmin" / "connections.json"
+    if not config_file.exists():
+        return None
+    
+    connections = json.loads(config_file.read_text())
+    conn = connections.get(name)
+    if not conn:
+        return None
+    
+    url = conn["url"]
+    
+    # Retrieve password from keyring if stored there
+    if conn.get("has_keyring_password"):
+        try:
+            import keyring
+            password = keyring.get_password("dbadmin", f"{name}_password")
+            if password:
+                parsed = urlparse(url)
+                # Reconstruct URL with password
+                netloc = f"{parsed.username}:{password}@{parsed.hostname}"
+                if parsed.port:
+                    netloc += f":{parsed.port}"
+                url = urlunparse((
+                    parsed.scheme,
+                    netloc,
+                    parsed.path,
+                    parsed.params,
+                    parsed.query,
+                    parsed.fragment
+                ))
+        except ImportError:
+            console.print("[red]Error: keyring required but not installed[/red]")
+            return None
+    
+    return url

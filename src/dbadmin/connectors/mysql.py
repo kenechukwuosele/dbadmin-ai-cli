@@ -1,5 +1,6 @@
 """MySQL database connector."""
 
+import re
 import time
 from typing import Any
 from urllib.parse import urlparse
@@ -7,6 +8,22 @@ from urllib.parse import urlparse
 import mysql.connector
 
 from dbadmin.connectors.base import BaseConnector, QueryResult, ExplainPlan
+
+
+# Valid identifier pattern (alphanumeric + underscore, no special chars)
+_VALID_IDENTIFIER = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
+
+
+def _validate_identifier(name: str) -> str:
+    """Validate and return a safe SQL identifier.
+    
+    Raises ValueError if the identifier contains potentially dangerous characters.
+    """
+    if not name or not _VALID_IDENTIFIER.match(name):
+        raise ValueError(f"Invalid identifier: {name!r}. Only alphanumeric characters and underscores allowed.")
+    if len(name) > 64:  # MySQL identifier limit
+        raise ValueError(f"Identifier too long: {name!r}")
+    return name
 
 
 class MySQLConnector(BaseConnector):
@@ -103,7 +120,9 @@ class MySQLConnector(BaseConnector):
             tables = [row[0] for row in cur.fetchall()]
             
             for table in tables:
-                cur.execute(f"DESCRIBE `{table}`")
+                # Tables from SHOW TABLES are safe, but validate anyway
+                safe_table = _validate_identifier(table)
+                cur.execute(f"DESCRIBE `{safe_table}`")
                 columns = []
                 for row in cur.fetchall():
                     columns.append({
@@ -128,13 +147,16 @@ class MySQLConnector(BaseConnector):
         cur = self._connection.cursor()
         
         try:
+            # Validate table name to prevent SQL injection
+            safe_table = _validate_identifier(table)
+            
             # Columns
-            cur.execute(f"DESCRIBE `{table}`")
+            cur.execute(f"DESCRIBE `{safe_table}`")
             info["columns"] = [{"name": r[0], "type": r[1], "nullable": r[2] == "YES"} 
                                for r in cur.fetchall()]
             
             # Indexes
-            cur.execute(f"SHOW INDEX FROM `{table}`")
+            cur.execute(f"SHOW INDEX FROM `{safe_table}`")
             indexes = {}
             for row in cur.fetchall():
                 idx_name = row[2]
@@ -143,15 +165,15 @@ class MySQLConnector(BaseConnector):
                 indexes[idx_name]["columns"].append(row[4])
             info["indexes"] = list(indexes.values())
             
-            # Size and count
-            cur.execute(f"SELECT COUNT(*) FROM `{table}`")
+            # Size and count - use parameterized query for table name in WHERE
+            cur.execute(f"SELECT COUNT(*) FROM `{safe_table}`")
             info["row_count"] = cur.fetchone()[0]
             
-            cur.execute(f"""
+            cur.execute("""
                 SELECT data_length + index_length 
                 FROM information_schema.tables 
-                WHERE table_name = '{table}'
-            """)
+                WHERE table_name = %s
+            """, (table,))
             row = cur.fetchone()
             info["size"] = row[0] if row else 0
         finally:
@@ -160,13 +182,26 @@ class MySQLConnector(BaseConnector):
         return info
     
     def explain_query(self, query: str) -> ExplainPlan:
-        """Get execution plan for a query."""
+        """Get execution plan for a query.
+        
+        Note: Only SELECT queries are allowed for EXPLAIN to prevent 
+        abuse through other statement types.
+        """
         if not self._connection:
             self.connect()
         
+        # Security: Only allow EXPLAIN on SELECT statements
+        query_upper = query.strip().upper()
+        if not query_upper.startswith('SELECT'):
+            return ExplainPlan(
+                raw_plan="",
+                warnings=["EXPLAIN only allowed for SELECT queries"]
+            )
+        
         cur = self._connection.cursor()
         try:
-            cur.execute(f"EXPLAIN {query}")
+            # Use EXPLAIN with the query (query is already validated as SELECT)
+            cur.execute("EXPLAIN " + query)
             rows = cur.fetchall()
             
             if rows:

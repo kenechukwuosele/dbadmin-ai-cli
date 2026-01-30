@@ -1,12 +1,30 @@
 """PostgreSQL database connector."""
 
+import re
 import time
 from typing import Any
 from urllib.parse import urlparse
 
 import psycopg
+from psycopg import sql
 
 from dbadmin.connectors.base import BaseConnector, QueryResult, ExplainPlan
+
+
+# Valid identifier pattern (alphanumeric + underscore, no special chars)
+_VALID_IDENTIFIER = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
+
+
+def _validate_identifier(name: str) -> str:
+    """Validate and return a safe SQL identifier.
+    
+    Raises ValueError if the identifier contains potentially dangerous characters.
+    """
+    if not name or not _VALID_IDENTIFIER.match(name):
+        raise ValueError(f"Invalid identifier: {name!r}. Only alphanumeric characters and underscores allowed.")
+    if len(name) > 63:  # PostgreSQL identifier limit
+        raise ValueError(f"Identifier too long: {name!r}")
+    return name
 
 
 class PostgreSQLConnector(BaseConnector):
@@ -124,6 +142,9 @@ class PostgreSQLConnector(BaseConnector):
         if not self._connection:
             self.connect()
         
+        # Validate table name to prevent SQL injection
+        safe_table = _validate_identifier(table)
+        
         info = {"table": table, "columns": [], "indexes": [], "size": 0, "row_count": 0}
         
         with self._connection.cursor() as cur:
@@ -145,8 +166,11 @@ class PostgreSQLConnector(BaseConnector):
             """, (table,))
             info["indexes"] = [{"name": n, "definition": d} for n, d in cur.fetchall()]
             
-            # Get size and count
-            cur.execute(f"SELECT pg_total_relation_size(%s), count(*) FROM {table}", (table,))
+            # Get size and count using sql.Identifier for safe table name
+            query = sql.SQL("SELECT pg_total_relation_size(%s), count(*) FROM {}").format(
+                sql.Identifier(safe_table)
+            )
+            cur.execute(query, (table,))
             row = cur.fetchone()
             if row:
                 info["size"] = row[0]
@@ -155,12 +179,28 @@ class PostgreSQLConnector(BaseConnector):
         return info
     
     def explain_query(self, query: str) -> ExplainPlan:
-        """Get execution plan for a query."""
+        """Get execution plan for a query.
+        
+        Note: Only SELECT queries are allowed for EXPLAIN to prevent 
+        abuse through other statement types.
+        """
         if not self._connection:
             self.connect()
         
+        # Security: Only allow EXPLAIN on SELECT statements
+        query_upper = query.strip().upper()
+        if not query_upper.startswith('SELECT'):
+            return ExplainPlan(
+                raw_plan="",
+                warnings=["EXPLAIN only allowed for SELECT queries"]
+            )
+        
         with self._connection.cursor() as cur:
-            cur.execute(f"EXPLAIN (FORMAT JSON, ANALYZE false) {query}")
+            # Construct EXPLAIN query safely - query is validated as SELECT above
+            explain_query = sql.SQL("EXPLAIN (FORMAT JSON, ANALYZE false) {}").format(
+                sql.SQL(query)
+            )
+            cur.execute(explain_query)
             result = cur.fetchone()
             
             if result:
