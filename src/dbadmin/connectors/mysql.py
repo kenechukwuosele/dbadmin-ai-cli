@@ -1,11 +1,12 @@
-"""MySQL database connector."""
+"""MySQL database connector with connection pooling."""
 
 import re
 import time
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 import mysql.connector
+from mysql.connector.pooling import MySQLConnectionPool
 
 from dbadmin.connectors.base import BaseConnector, QueryResult, ExplainPlan
 
@@ -27,7 +28,30 @@ def _validate_identifier(name: str) -> str:
 
 
 class MySQLConnector(BaseConnector):
-    """MySQL/MariaDB database connector."""
+    """MySQL/MariaDB database connector with connection pooling.
+    
+    Connection pooling prevents hitting database connection limits
+    and improves performance by reusing connections.
+    """
+    
+    # Class-level pool cache keyed by connection URL
+    _pools: dict[str, MySQLConnectionPool] = {}
+    _pool_counter: int = 0  # For unique pool names
+    
+    def __init__(
+        self, 
+        url: str, 
+        pool_size: int = 5,
+    ):
+        """Initialize connector with pooling configuration.
+        
+        Args:
+            url: MySQL connection URL
+            pool_size: Number of connections in the pool
+        """
+        super().__init__(url)
+        self.pool_size = pool_size
+        self._pool: Optional[MySQLConnectionPool] = None
     
     def _parse_url(self) -> dict[str, Any]:
         """Parse MySQL connection URL."""
@@ -40,16 +64,35 @@ class MySQLConnector(BaseConnector):
             "database": parsed.path.strip("/") or None,
         }
     
+    def _get_pool(self) -> MySQLConnectionPool:
+        """Get or create connection pool for this URL."""
+        if self.url not in MySQLConnector._pools:
+            MySQLConnector._pool_counter += 1
+            config = self._parse_url()
+            MySQLConnector._pools[self.url] = MySQLConnectionPool(
+                pool_name=f"dbadmin_pool_{MySQLConnector._pool_counter}",
+                pool_size=self.pool_size,
+                pool_reset_session=True,
+                **config,
+            )
+        return MySQLConnector._pools[self.url]
+    
     def connect(self) -> None:
-        """Establish MySQL connection."""
-        config = self._parse_url()
-        self._connection = mysql.connector.connect(**config)
+        """Get a connection from the pool."""
+        self._pool = self._get_pool()
+        self._connection = self._pool.get_connection()
     
     def disconnect(self) -> None:
-        """Close MySQL connection."""
+        """Return connection to the pool."""
         if self._connection:
-            self._connection.close()
+            self._connection.close()  # Returns to pool automatically
             self._connection = None
+    
+    @classmethod
+    def close_all_pools(cls) -> None:
+        """Close all connection pools. Call on application shutdown."""
+        # MySQL pools don't have explicit close, just clear the cache
+        cls._pools.clear()
     
     def test_connection(self) -> dict[str, Any]:
         """Test connection and return database info."""

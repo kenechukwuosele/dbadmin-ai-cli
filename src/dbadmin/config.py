@@ -52,6 +52,11 @@ class Settings(BaseSettings):
     slow_query_threshold_ms: int = Field(default=1000)  # 1 second
     health_check_interval_seconds: int = Field(default=10)
     
+    # Rate limiting
+    llm_requests_per_minute: int = Field(default=20)
+    llm_tokens_per_minute: int = Field(default=100_000)
+    llm_rate_limit_enabled: bool = Field(default=True)
+    
     def get_configured_databases(self) -> dict[str, str]:
         """Get all configured database URLs."""
         dbs = {}

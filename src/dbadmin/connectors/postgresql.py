@@ -1,14 +1,20 @@
-"""PostgreSQL database connector."""
+"""PostgreSQL database connector with connection pooling and async support."""
 
-import re
 import time
-from typing import Any
+import re
+import logging
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 import psycopg
-from psycopg import sql
+from psycopg import sql, AsyncConnection
+from psycopg_pool import ConnectionPool
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from dbadmin.connectors.base import BaseConnector, QueryResult, ExplainPlan
+from dbadmin.connectors.base_async import AsyncBaseConnector
+
+logger = logging.getLogger(__name__)
 
 
 # Valid identifier pattern (alphanumeric + underscore, no special chars)
@@ -28,17 +34,110 @@ def _validate_identifier(name: str) -> str:
 
 
 class PostgreSQLConnector(BaseConnector):
-    """PostgreSQL database connector using psycopg3."""
+    """PostgreSQL database connector using psycopg3 with connection pooling.
     
+    Connection pooling prevents hitting database connection limits
+    and improves performance by reusing connections.
+    """
+    
+    # Class-level pool cache to share pools across instances
+    _pools: dict[str, ConnectionPool] = {}
+    
+    def __init__(
+        self, 
+        url: str, 
+        pool_min_size: int = 2, 
+        pool_max_size: int = 10,
+        pool_timeout: float = 30.0,
+    ):
+        """Initialize connector with pooling configuration.
+        
+        Args:
+            url: PostgreSQL connection URL
+            pool_min_size: Minimum connections to keep open
+            pool_max_size: Maximum connections allowed
+            pool_timeout: Timeout waiting for a connection from pool
+        """
+        super().__init__(url)
+        self.pool_min_size = pool_min_size
+        self.pool_max_size = pool_max_size
+        self.pool_timeout = pool_timeout
+        self._pool: Optional[ConnectionPool] = None
+    
+    def _get_pool(self) -> ConnectionPool:
+        """Get or create connection pool for this URL."""
+        if self.url not in PostgreSQLConnector._pools:
+            PostgreSQLConnector._pools[self.url] = ConnectionPool(
+                self.url,
+                min_size=self.pool_min_size,
+                max_size=self.pool_max_size,
+                timeout=self.pool_timeout,
+                open=True,
+            )
+        return PostgreSQLConnector._pools[self.url]
+    
+    # Circuit breaker state
+    _failure_count: dict[str, int] = {}
+    _circuit_open_until: dict[str, float] = {}
+    _FAILURE_THRESHOLD = 5
+    _CIRCUIT_TIMEOUT = 60.0  # seconds
+    
+    def _check_circuit_breaker(self) -> None:
+        """Check if circuit breaker is open, raise if so."""
+        if self.url in self._circuit_open_until:
+            if time.time() < self._circuit_open_until[self.url]:
+                raise ConnectionError(
+                    f"Circuit breaker open for this connection. "
+                    f"Retry after {self._circuit_open_until[self.url] - time.time():.1f}s"
+                )
+            else:
+                # Circuit timeout expired, allow retry
+                del self._circuit_open_until[self.url]
+                self._failure_count[self.url] = 0
+    
+    def _record_failure(self) -> None:
+        """Record a connection failure and potentially open circuit breaker."""
+        self._failure_count[self.url] = self._failure_count.get(self.url, 0) + 1
+        if self._failure_count[self.url] >= self._FAILURE_THRESHOLD:
+            self._circuit_open_until[self.url] = time.time() + self._CIRCUIT_TIMEOUT
+            logger.warning(f"Circuit breaker opened for {self.url[:50]}...")
+    
+    def _record_success(self) -> None:
+        """Record a successful connection, reset failure count."""
+        self._failure_count[self.url] = 0
+        if self.url in self._circuit_open_until:
+            del self._circuit_open_until[self.url]
+    
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception_type((psycopg.OperationalError, ConnectionError)),
+        reraise=True,
+    )
     def connect(self) -> None:
-        """Establish PostgreSQL connection."""
-        self._connection = psycopg.connect(self.url)
+        """Get a connection from the pool with retry and circuit breaker."""
+        self._check_circuit_breaker()
+        try:
+            self._pool = self._get_pool()
+            self._connection = self._pool.getconn()
+            self._record_success()
+        except Exception as e:
+            self._record_failure()
+            logger.warning(f"Connection failed: {e}")
+            raise
     
     def disconnect(self) -> None:
-        """Close PostgreSQL connection."""
-        if self._connection:
-            self._connection.close()
+        """Return connection to the pool (not close it)."""
+        if self._connection and self._pool:
+            self._pool.putconn(self._connection)
             self._connection = None
+    
+    @classmethod
+    def close_all_pools(cls) -> None:
+        """Close all connection pools. Call on application shutdown."""
+        for pool in cls._pools.values():
+            pool.close()
+        cls._pools.clear()
     
     def test_connection(self) -> dict[str, Any]:
         """Test connection and return database info."""
@@ -95,6 +194,67 @@ class PostgreSQLConnector(BaseConnector):
             return QueryResult(error="Only SELECT, EXPLAIN, SHOW, and WITH queries allowed in read-only mode")
         
         return self.execute(query, params)
+    
+    # ===== Async Methods =====
+    
+    async def connect_async(self) -> None:
+        """Establish async PostgreSQL connection."""
+        self._async_connection = await AsyncConnection.connect(self.url)
+    
+    async def disconnect_async(self) -> None:
+        """Close async PostgreSQL connection."""
+        if self._async_connection:
+            await self._async_connection.close()
+            self._async_connection = None
+    
+    async def execute_async(
+        self, 
+        query: str, 
+        params: tuple | None = None
+    ) -> QueryResult:
+        """Execute a query asynchronously and return results.
+        
+        This is the critical path async method for non-blocking queries.
+        """
+        if not self._async_connection:
+            await self.connect_async()
+        
+        start = time.perf_counter()
+        
+        try:
+            async with self._async_connection.cursor() as cur:
+                await cur.execute(query, params)
+                
+                if cur.description:
+                    columns = [desc[0] for desc in cur.description]
+                    rows = await cur.fetchall()
+                else:
+                    columns = []
+                    rows = []
+                
+                await self._async_connection.commit()
+                
+                return QueryResult(
+                    columns=columns,
+                    rows=rows,
+                    row_count=cur.rowcount,
+                    execution_time_ms=(time.perf_counter() - start) * 1000,
+                )
+        except Exception as e:
+            await self._async_connection.rollback()
+            return QueryResult(error=str(e))
+    
+    async def execute_read_only_async(
+        self, 
+        query: str, 
+        params: tuple | None = None
+    ) -> QueryResult:
+        """Execute a read-only query asynchronously."""
+        query_upper = query.strip().upper()
+        if not query_upper.startswith(("SELECT", "EXPLAIN", "SHOW", "WITH")):
+            return QueryResult(error="Only SELECT, EXPLAIN, SHOW, and WITH queries allowed in read-only mode")
+        
+        return await self.execute_async(query, params)
     
     def get_schema(self) -> dict[str, Any]:
         """Get database schema."""
